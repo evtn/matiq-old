@@ -1,0 +1,1341 @@
+#!/usr/bin/env python3
+
+from typing import Union, Any
+from inspect import signature
+import sys
+import unicodedata as unidata
+
+need_verbose = False
+need_debug = False
+
+
+verbose = lambda *args, **kwargs: print(*args, **kwargs) if need_verbose else None
+debug = lambda *args, **kwargs: print(*args, **kwargs) if need_debug else None
+
+
+def depth_counter(line):
+    stripped = line.lstrip()
+    return (line.count(" ") + line.count("\t")) - (stripped.count(" ") + stripped.count("\t"))
+
+def parse_indents(lines):
+    lines = lines[:]
+    result = []
+    while lines:
+        if lines[0].startswith("#!"):
+            lines = lines[1:]
+            continue
+        base = lines[0].rstrip()
+        base_count = depth_counter(lines[0])
+        children = []
+        
+        # check for possible children
+        for line in lines[1:]:
+            if depth_counter(line) <= base_count:
+                break
+            children.append(line)
+
+        # building a node
+        result.append({
+            "line": base,
+            "sublines": parse_indents(children)
+        }) 
+
+        # pushing forward
+        lines = lines[1 + len(children):]
+    return result
+
+
+errors = ["NestingError", "ParseError", "EvaluationError"]
+
+globals().update(
+    {k: type(k, (BaseException, ), {}) for k in errors}
+)
+
+
+class ContextDict(dict):
+    reserved = ["context"]
+    def __setitem__(self, item, value):
+        if item in self.reserved:
+            raise EvaluationError(f"Can't set '{item}' variable: name is reserved")
+        super().__setitem__(item, value)
+
+
+class Context:
+    keywords = ["context"]
+    def __init__(self, lines, data=None, name="root", line_number=None, parent=None, parent_access=True):
+        self.data = data or ContextDict()
+        self.lines = lines
+        self.name = name
+        self.parent = parent
+        self.line_number = line_number
+        self.parent_access = parent_access
+
+    def parse(self):
+        nodes = parse_indents(
+            list(filter(lambda x: x, self.lines))
+        ) if self.lines and isinstance(self.lines[0], str) else self.lines
+        debug(nodes)
+        line_number = 1
+        result = []
+        try:
+            for node in nodes:
+                self.current_line = [node["line"], line_number]
+                if not node["line"]:
+                    continue
+                i, parsed = Parser(self, **node, line_number=line_number).parse()
+                if isinstance(parsed, Expression) and not len(parsed.content):
+                    continue
+                result.append(parsed)
+        except Exception as e:
+            if need_debug:
+                raise e
+            raise ParseError(self.error(e.args[0]))
+        return result
+
+    def run_lines(self, lines):
+        result = None
+        try:
+            for i, line in enumerate(lines):
+                self.current_line = [str(line), i]
+                if line:
+                    if need_debug:
+                        result = line.solve(result)
+                    else:
+                        try:
+                            result = line.solve(result)
+                        except RecursionError:
+                            raise EvaluationError(self.error("Your program falls into an infinite recursion.\nThat's often happens in operation on undefined variable", i + 1))
+                    globals()["need_debug"] = self.data.get("debug", need_debug)
+                    globals()["need_verbose"] = self.data.get("verbose", need_verbose)
+                    if result in [Break.key, Continue.key]:
+                        return result
+        except Exception as e:
+            if need_debug:
+                raise e
+            raise EvaluationError(self.error(str(e.args[0])))
+        return result
+
+    def run(self):
+        return self.run_lines(self.parse())
+
+    def subcontext(self, lines, name="null", line_number=0):
+        return Context(lines, data={}, name=name, parent=self, line_number=line_number)
+
+    def __str__(self):
+        return "\n".join(self.lines)
+
+    def error(self, text, line_num=None):
+        text = [str(self) if need_verbose else "", self.tree(), text]
+        return "\n".join(text)
+
+    def tree(self, line_num=None):
+        name = ":".join([self.name, str(self.current_line[1] + 1)])
+        if self.parent:
+            ptree = self.parent.tree()
+        else:
+            ptree = ""
+        return "\n".join([ptree, f"in {name}:", f"    {self.current_line[0].strip()}"])
+
+    def __getitem__(self, item):
+        if item == "context":
+            return self
+        if item in self.data:
+            return self.data[item]
+        if not self.parent or not self.parent_access:
+            raise EvaluationError(self.error(f"{item} is undefined"))
+        return self.parent[item]
+
+    def __setitem__(self, item, value):
+        self.data[item] = value
+        return value
+
+    def pop(self, item):
+        return self.data.pop(item)
+
+    def update(self, data):
+        return self.data.update(data)
+
+    def flush(self):
+        self.parent.data.update(self.data)
+        self.clear()
+
+    def __str__(self):
+        data = '\n'.join(['', *[f'    {key}: {value}' for key, value in self.data.items()], '']) if self.data else '' 
+        parent = ('' if not self.parent else 'Parent Context: ({}{})').format(
+            '\n    '.join(['', *str(self.parent).split('\n')]),
+            '\n' if self.parent else ''
+        )
+        return f"Context '{self.name}': {{{data}}}. {parent}"
+
+    def clear(self):
+        self.data.clear()
+
+
+class Parser:
+    states = {
+        "default": ["String", "Number", "Expression", "Variable", "UnaryOperator", "List"],
+        "expression": ["Operator", "Variable", "FunctionCall"],
+        "operator-only": ["Operator", "FunctionCall"],
+        "variable": ["Operator", "Indexing", "FunctionCall"],
+        "for_identifier": ["Variable"],
+        "for_in": ["Other[in]"],
+        "for_range": ["Range"],
+        "arglist": ["List"],
+        "list": ["Indexing"],
+        "ffn": ["Name", "Name as Varname"]
+    }
+    def __init__(self, context, line, sublines=None, line_number=None, is_toplevel=True):
+        self.state = None
+        self.expected = "default"
+        self.line = line.strip()
+        self.sublines = sublines
+        self.is_toplevel = is_toplevel
+        self.line_number = line_number
+        self.context = context
+
+    def unexpected(self, char):
+        expected = " / ".join(self.states[self.expected])
+        return ParseError(self.context.error(f"Line {self.line_number}: Unexpected '{char}'. Expected: {expected}", self.line_number))
+
+    def unexpectedEOF(self):
+        expected = " / ".join(self.states[self.expected])
+        return ParseError(self.context.error(f"Line {self.line_number}: Unexpected end of line! Expected: {expected}", self.line_number))
+
+    def parse(self):
+        i = 0
+        while self[i].isspace():
+            i += 1
+            continue
+
+        debug(i, self.line[i:])
+        blocks = {
+            "for": For,
+            "if": If,
+            "else": Else,
+            "elif": Else,
+            "while": While,
+            "import": Import,
+            "use": Import,
+            "fn": FunctionDef,
+            "ffn": ForeignFunction
+        }
+
+        for block in blocks:
+            if self[i:].startswith(f"{block}" + " " * (block != "else")):
+                if self.is_toplevel:
+                    return blocks[block].parse(self, i)
+                raise ParseError(self.context.error(f"'{block}' is a block, can't be used as an expression"))
+        if self[i:].strip() == "break":
+            return 0, Break()
+        if self[i:].strip() == "continue":
+            return 0, Continue()
+
+
+        result = []
+        debug(i, self[:], "new parsing")
+        while i < len(self.line):
+            while self[i].isspace():
+                i += 1
+                continue
+
+            debug(i, self[i], self.expected, self.states[self.expected])
+            if self[i:].startswith("//"):
+                break
+            if self[i] in "),]":
+                break
+            if (
+                "String" in self.states[self.expected]
+                and self[i] in ["'", '"']
+            ):
+                i, token = String.parse(self, i)
+                result.append(token)
+                self.expected = "variable"
+                continue
+            if (
+                "FunctionCall" in self.states[self.expected] 
+                and self[i] == "("
+            ):
+                func = result.pop()
+                i, token = FunctionCall.parse(self, i, func)
+                result.append(token)
+                self.expected = "expression"
+                continue
+            if (
+                "Indexing" in self.states[self.expected] 
+                and (self[i] == "[")
+                and result
+            ):
+                i, token = Indexing.parse(self, i)
+                token.reference = result.pop()
+                result.append(token)
+                self.expected = "operator-only"
+                continue
+            if (
+                "List" in self.states[self.expected] 
+                and (self[i] == "[")
+            ):
+                i, token = List.parse(self, i + 1)
+                result.append(token)
+                self.expected = "list"
+                continue
+            if (
+                "UnaryOperator" in self.states[self.expected] 
+                and (self[i] in UnaryOperator.priorities)
+            ):
+                token = UnaryOperator(self[i], self.context)
+                i += 1
+                result.append(token)
+                continue
+            if (
+                "Variable" in self.states[self.expected] 
+                and (self[i].isalpha() or self[i] == "_")
+            ):
+                i, token = Variable.parse(self, i)
+                if self.expected == "expression":
+                    result.append(Operator.multiply(self.context))
+                result.append(token)
+                self.expected = "variable"
+                continue
+            if (
+                "Number" in self.states[self.expected] 
+                and (self[i].isnumeric() or self[i] in "-.")
+            ):
+                i, token = Number.parse(self, i)
+                result.append(token)
+                self.expected = "expression"
+                continue
+
+            if (
+                "Operator" in self.states[self.expected] 
+                and (self[i] in Operator.priorities)
+            ):
+                i, token = Operator.parse(self, i)
+                result.append(token)
+                self.expected = "default"
+                continue
+            if (
+                "Expression" in self.states[self.expected]
+                and self[i] == "("
+            ):
+                j, token = Parser(self.context, self[i + 1:], line_number=self.line_number, is_toplevel=False).parse()
+                i += j + 2
+                result.append(token)
+                self.expected = "expression"
+                continue
+            raise self.unexpected(self[i])
+        return i, Expression(result, self.context).unwrap()
+
+    def __getitem__(self, item):
+        if isinstance(item, int) and item >= len(self.line):
+            raise self.unexpectedEOF()
+        return self.line[item]
+
+
+class Token:
+    def __str__(self):
+        return "<some token>"
+
+    def __repr__(self):
+        return str(self)
+
+
+class Expression(Token):
+    def __init__(self, content, context: Context):
+        self.content = content
+        self.context = context
+
+    def solve(self, prev_result=None):
+        if len(self.content) == 1:
+            return self.ensure_token(self.content[0]).solve()
+        unary_operators = self.unary_operators()
+        if unary_operators:
+
+            next_op = max(
+                unary_operators, 
+                key=lambda key: UnaryOperator.priorities[unary_operators[key].operation] + (key / len(self.content))
+            )
+            
+            result = self.content[:]
+            debug(result, next_op)
+
+            op_result = unary_operators[next_op].solve(
+                result[next_op + 1],
+            )
+            debug(op_result)
+            result[next_op: next_op + 2] = [op_result]
+        else:
+            operators = self.operators()
+            next_op = max(
+                operators, 
+                key=lambda key: operators[key].priority + (key / len(self.content))
+            )
+            
+            result = self.content[:]
+            debug(result, next_op)
+            op_result = operators[next_op].solve(
+                result[next_op - 1], 
+                result[next_op + 1],
+            )
+            result[next_op - 1: next_op + 2] = [op_result]
+        return Expression(result, self.context).solve()
+
+    def operators(self):
+        return {i: token for i, token in enumerate(self.content) if isinstance(token, Operator)}
+
+    def unary_operators(self):
+        return {i: token for i, token in enumerate(self.content) if isinstance(token, UnaryOperator)}
+
+    def negative(self, **kwargs):
+        result = self.solve(**kwargs)
+        if isinstance(result, Token):
+            return Expression([Number(-1), Operator("*"), result])
+        return -result
+
+    def __str__(self):
+        return (
+            f"({' '.join(map(str, self.content))})" 
+            if len(self.content) > 1 
+            else str(self.content[0])
+        )
+
+    def unwrap(self):
+        if len(self.content) == 1:
+            if isinstance(self.content[0], Expression):
+                return self.content[0].unwrap()
+            return self.content[0]
+        return self
+
+
+class Variable(Token):
+    def __init__(self, identifier, context):
+        self.identifier = identifier
+        self.context = context
+
+    def solve(self, prev_result=None):
+        result = self.context[self.identifier]
+        if isinstance(result, Token):
+            return result.solve()
+        if result is None:
+            return self
+        return result
+
+    def __str__(self):
+        return self.identifier
+
+    def parse(self: Parser, i):
+        name = []
+        while i < len(self.line):
+            if (
+                (name and self[i].isnumeric())
+                or self[i].isalpha()
+                or self[i] == "_"
+            ):
+                name.append(self[i])
+            else:
+                break
+            i += 1
+        if not name:
+            raise self.unexpectedEOF()
+        return i, Variable("".join(name), context=self.context)
+
+
+class Value(Token):
+    def __init__(self, value, context: Context):
+        self.value = value
+        self.context = context
+
+    def solve(self, prev_result=None):
+        value = self.value
+        if type(value) is float and value.is_integer():
+            value = int(value)
+        return value
+
+    def __str__(self):
+        return str(self.solve())
+
+
+class Number(Token):
+    def __init__(self, value, context: Context):
+        self.value = value
+        self.context = context
+
+    def solve(self, prev_result=None):
+        return self.value 
+
+    def __str__(self):
+        return str(self.value)
+
+    def parse(self: Parser, i):
+        name = []
+        while i < len(self.line):
+            if (
+                self[i].isnumeric()
+                or (self[i] == "." and self[i + 1].isnumeric() and "." not in name)
+                or (not name and self[i] == "-")
+            ):
+                name.append(self[i])
+            else:
+                break
+            i += 1
+
+        if not name:
+            raise self.unexpectedEOF()
+        number = float("".join(name))
+        return i, Number(number, context=self.context)
+
+
+class UnaryOperator(Token):
+    priorities = {
+        "@": 2,
+        "-": 1,
+        "~": 1,
+        "?": 2,
+        ">": 2,
+    }
+    def __init__(self, operation, context):
+        self.operation = operation
+        self.context = context
+
+    def solve(self, right):
+        if self.operation == "@":
+            right_solved = right.solve()
+            print(right_solved)
+            return self.ensure_token(right_solved)
+        if self.operation == "-":
+            return self.ensure_token(
+                Expression([Number(0, self.context), Operator("-", self.context), right], self.context).solve(),
+            )
+        if self.operation == "~":
+            return self.ensure_token(
+                Expression(
+                    [
+                        UnaryOperator("-", self.context), 
+                        right, 
+                        Operator("-", self.context), 
+                        Number(1, self.context)
+                    ], 
+                    self.context
+                ).solve(),
+            )
+        if self.operation == "?":
+            right_solved = right.solve()
+            if isinstance(right_solved, (list, str, tuple)):
+                return Number(len(right_solved), self.context)
+            if isinstance(right_solved, Token):
+                raise EvaluationError(self.context.error(f"Can't determine value of {right} to use '?' operator"))
+            return Number(bool(right_solved), self.context)
+
+        if self.operation == ">":
+            return String(input(f"{right.solve()} > "), self.context)
+
+    def __str__(self):
+        return self.operation
+
+
+class Operator(Token):
+    priorities = {
+        "=": 1, 
+        "==": 2, 
+        "!=": 2, 
+        "<=": 3, 
+        ">=": 3, 
+        "<": 3, 
+        ">": 3, 
+        "|": 4,
+        "^": 4,
+        "&": 5,
+        "<<": 6,
+        ">>": 6,
+        "+": 7, 
+        "-": 7, 
+        "*": 8, 
+        "/": 8, 
+        "%": 8, 
+        "/_": 8, 
+        "**": 9,
+
+    }
+    operations = {
+        "**": "__pow__",
+        "*": "__mul__",
+        "/": "__truediv__",
+        "+": "__add__",
+        "-": "__sub__",
+        "/_": "__floordiv__",
+        "%": "__mod__",
+        "==": "__eq__",
+        "!=": "__neq__",
+        "<=": "__le__",
+        ">=": "__ge__",
+        "<": "__lt__",
+        ">": "__gt__",
+        "^": "__xor__",
+        "&": "__and__",
+        "|": "__or__",
+        "<<": "__lshift__",
+        ">>": "__rshift__"
+    }
+    assignment_ops = ["="]
+    def __init__(self, operation: str, context: Context):
+        self.operation = operation
+        self.context = context
+
+    def assignment(self, left, right):
+        if not isinstance(left, (Variable, Indexing)):
+            raise EvaluationError(self.context.error(f"Assignment can be used only on Variables and Indexing, not on {left.__class__.__name__}"))
+        
+        right_solved = self.ensure_token(right.solve())
+        if self.operation == "=":
+            if isinstance(left, Indexing):
+                return left.assign(right_solved)
+            self.context[left.identifier] = right_solved
+            return right_solved
+        if isinstance(right_solved, Value):
+            result = self.ensure_token(Expression([left, Operator(self.operation[:-1], self.context), right_solved], self.context).solve())
+            Expression([left, Operator("=", self.context), result], self.context).solve()
+            return result
+        return Expression([left, self, right], self.context)
+
+    def solve(self, left, right):
+        if self.operation in self.assignment_ops:
+            return self.assignment(left, right)
+        left_solved = left.solve()
+        right_solved = right.solve()
+        if any(isinstance(x, Token) for x in [left_solved, right_solved]):
+            return Expression([
+                self.ensure_token(left_solved),
+                self,
+                self.ensure_token(right_solved)
+            ], self.context)
+
+        left_solved = Value(left_solved, self.context).solve()
+
+        if isinstance(left_solved, int):
+            left_solved = float(left_solved)
+        if self.operation in ["^", "&", "|", ">>", "<<"]:
+            left_solved = int(left_solved)
+            right_solved = int(right_solved)
+
+        result = getattr(left_solved, self.operations[self.operation])(right_solved)
+        if result is NotImplemented:
+            raise EvaluationError(
+                self.context.error(
+                    f"Can't use '{self.operation}' on '{type(left_solved).__name__}' and '{type(right_solved).__name__}'"
+                )
+            )
+        verbose("> {} {} {} = {}".format(left, self, right, result))
+        return self.ensure_token(result)
+
+    def parse(self: Parser, i):
+        name = []
+        start_i = i
+        while i < len(self.line):
+            if (
+                self[i] in map(lambda x: x[i - start_i] if len(x) > i - start_i else "", Operator.priorities)
+            ):
+                name.append(self[i])
+            else:
+                break
+            i += 1
+
+        if not name:
+            raise self.unexpectedEOF()
+        name = "".join(name)
+        return i, Operator(name, context=self.context)
+
+    @property
+    def priority(self):
+        return self.priorities[self.operation]
+
+    def __str__(self):
+        return self.operation
+
+
+class Range(Token):
+    def __init__(self, values, context):
+        self.values = list(values)
+        self.context = context
+
+    def get_values(self):
+        return [*map(lambda v: int(v.solve()), self.values), 1][:3]
+
+    def __iter__(self):
+        start, stop, step = self.get_values()
+        tokens = filter(lambda x: isinstance(x, Token), [start, stop, step])
+        if any(tokens):
+            raise EvaluationError(self.context.error(f"Range has undefined values at evaluation time: {', '.join(map(str, tokens))}"))
+        debug(start, stop, step)
+        return iter(range(start, stop, step))
+
+    def __str__(self):
+        return "..".join(map(str, self.values))
+
+    def solve(self, prev_result=None):
+        return self
+
+    def parse(self: Parser, i, i_end=None):
+        if ".." not in self[i:i_end]:
+            raise self.unexpectedEOF()
+        values = self[i:i_end].split("..")
+        if len(values) < 1:
+            raise ParseError(self.context.error("Range needs 2 values, got 1", self.line_number))
+        if len(values) > 3:
+            raise self.unexpected("..".join(["", values[3:]]))
+        values = map(
+            lambda x: Parser(self.context, x, line_number=self.line_number, is_toplevel=False).parse()[1],
+            values
+        )
+        return (i_end or len(self[:])), Range(values, context=self.context)
+
+
+class Break(Token):
+    key = str(object())
+    def __init__(self):
+        pass
+
+    def solve(self, prev_result):
+        return self.key
+
+
+class Continue(Token):
+    key = str(object())
+    def __init__(self):
+        pass
+
+    def solve(self, prev_result):
+        return self.key
+
+
+class Block(Token):
+    @staticmethod
+    def stringify(lines):
+        return "".join(
+            map(
+                lambda x: f"{x['line']}" + "\n" + Block.stringify(x['sublines']), 
+                lines
+            )
+        ).strip("\n")
+
+    def __init__(self, lines, context, line_number):
+        self.context = context
+        self.lines = lines
+        self.line_number = line_number
+        self.subcontext = self.context.subcontext(lines, name=self.__class__.__name__, line_number=line_number)
+        self.lines_parsed = self.subcontext.parse()
+
+
+class If(Block):
+    def __init__(self, condition, lines, context, line_number):
+        self.condition = condition
+        super().__init__(lines, context, line_number)
+
+    def solve(self, prev_result=None):
+        result = None
+        condition = self.condition.solve()
+        
+        if isinstance(condition, Token):
+            raise EvaluationError(self.context.error(f"If has undefined condition at evaluation time: {condition}", self.line_number))
+        
+        if condition:
+            result = self.subcontext.run_lines(self.lines_parsed)
+            self.subcontext.flush()
+        
+        if result in {Break.key, Continue.key}:
+            return result
+        return condition
+
+    def parse(self: Parser, i):
+        i = 3
+        self.expected = "default"
+        while i < len(self.line):
+            if self[i].isspace():
+                i += 1
+                continue
+            j, condition = Parser(self.context, self[i:], line_number=self.line_number, is_toplevel=False).parse()
+            return i + j, If(condition, self.sublines, self.context, self.line_number)
+
+    def __str__(self):
+        return f"if {self.condition}"
+
+
+class Else(Block):
+    def __init__(self, subcondition, lines, context, line_number):
+        self.subcondition = subcondition
+        super().__init__(lines, context, line_number)
+
+    def solve(self, prev_result=None):
+        result = None
+        if prev_result:
+            return False
+
+        if self.subcondition is None:
+            condition = True
+        else:
+            condition = self.subcondition.solve()
+
+        if isinstance(condition, Token):
+            raise EvaluationError(self.context.error(f"Else has undefined condition at evaluation time: {condition}", self.line_number))
+        
+        if condition:
+            result = self.subcontext.run_lines(self.lines_parsed)
+            self.subcontext.flush()
+        
+        if result in {Break.key, Continue.key}:
+            return result
+        return condition
+
+    def parse(self: Parser, i):
+        i = 4
+        self.expected = "default"
+        while i < len(self.line):
+            if self[i].isspace():
+                i += 1
+                continue
+            if self[:4] == "elif":
+                j, subcondition = Parser(self.context, self[i:], line_number=self.line_number, is_toplevel=True).parse()
+            else:
+                j = len(self[:]) - i
+                subcondition = None
+            return i + j, Else(subcondition, self.sublines, self.context, self.line_number)
+        return 5, Else(None, self.sublines, self.context, self.line_number)
+
+    def __str__(self):
+        if self.subcondition is None:
+            return "else"
+        return f"elif {self.subcondition}"
+
+
+class While(Block):
+    def __init__(self, condition, lines, context, line_number):
+        self.condition = condition
+        super().__init__(lines, context, line_number)
+
+    def solve(self, prev_result=None):
+        result = None
+        while True:
+            condition = self.condition.solve()
+            if isinstance(condition, Token):
+                raise EvaluationError(self.context.error(f"While has undefined condition at evaluation time: {condition}", self.line_number))
+            if not condition:
+                break
+
+            result = self.subcontext.run_lines(self.lines_parsed)
+            self.subcontext.flush()
+
+            if result is Break.key:
+                break
+            if result is Continue.key:
+                continue
+            
+        return result is Break.key
+
+    def parse(self: Parser, i):
+        i = 6
+        self.expected = "default"
+        while i < len(self.line):
+            if self[i].isspace():
+                i += 1
+                continue
+            j, condition = Parser(self.context, self[i:], line_number=self.line_number, is_toplevel=False).parse()
+            return i + j, While(condition, self.sublines, self.context, self.line_number)
+
+    def __str__(self):
+        return f"while {self.condition}"
+
+
+class For(Block):
+    def __init__(self, identifier, range_, lines, context, line_number):
+        self.identifier = identifier
+        self.range = range_
+        super().__init__(lines, context, line_number)
+
+    def solve(self, prev_result=None):
+        result = None
+        for i in self.range:
+            self.subcontext[self.identifier] = i
+            
+            result = self.subcontext.run_lines(self.lines_parsed)
+
+            self.subcontext.pop(self.identifier)
+            self.subcontext.flush()
+            
+            if result is Break.key:
+                break
+            if result is Continue.key:
+                continue
+        return result is Break.key
+
+    def __str__(self):
+        return f"for {self.identifier} in {self.range}"
+
+    def parse(self: Parser, i):
+        i = 4
+        self.expected = "for_identifier"
+        while i < len(self.line):
+            if self[i].isspace():
+                i += 1
+                continue
+            if self.expected == "for_identifier":
+                i, identifier = Variable.parse(self, i)
+                identifier = identifier.identifier
+                self.expected = "for_in"
+                continue
+            if self.expected == "for_in":
+                in_place = self[i:i + 2]
+                if in_place == "in":
+                    i += 2
+                    self.expected = "for_range"
+                    continue
+                raise self.unexpected(self[i:i + 2])
+            if self.expected == "for_range":
+                i, range_ = Range.parse(self, i)
+                # identifier, range_, lines, context, line_number
+                return i, For(identifier, range_, self.sublines, self.context, self.line_number)
+
+
+class FunctionDef(Block):
+    def __init__(self, name, args, lines, context, line_number):
+        self.name = name
+        self.args = args
+        debug("args(func):", self.args)
+        super().__init__(lines, context, line_number)
+        self.subcontext.name = name
+
+    def solve(self, prev_result=None):
+        self.context[self.name] = self
+        return self
+
+    def __call__(self, args):
+        result = None
+        func_scope = {self.args[i].identifier: args[i] for i in range(len(self.args))}
+        self.subcontext.update(func_scope)
+        result = self.subcontext.run_lines(self.lines_parsed)
+        return result
+
+    def parse(self: Parser, i):
+        i = 3
+        self.expected = "for_identifier"
+        while i < len(self.line):
+            if self[i].isspace():
+                i += 1
+                continue
+            if self.expected == "for_identifier":
+                i, identifier = Variable.parse(self, i)
+                identifier = identifier.identifier
+                self.expected = "arglist"
+                continue
+            if self.expected == "arglist":
+                i, arglist = List.parse(self, i + 1, expect="for_identifier")
+                
+                return i, FunctionDef(identifier, arglist.content, self.sublines, self.context, self.line_number)
+
+    def __str__(self):
+        return f"fn {self.name}({str(self.args).strip('[]')})"
+
+
+class FunctionCall(Token):
+    def __init__(self, func, context, args):
+        self.func = func
+        self.args = args
+        self.context = context
+        debug("args(call):", self.args)
+
+    def solve(self, prev_result=None):
+        args = [arg.solve() for arg in self.args]
+        func = self.func.solve()
+        if func is None:
+            raise EvaluationError(self.context.error(f"Undefined function '{self.func}'"))
+        if not isinstance(func, (FunctionDef, ForeignFunction)):
+            raise EvaluationError(self.context.error(f"'{self.func}' is not a function"))
+        return self.ensure_token(func(args), Number)
+
+    def parse(self: Parser, i, func):
+        while i < len(self.line):
+            if self[i].isspace() or self[i] == "(":
+                i += 1
+                continue
+            i, arglist = List.parse(self, i)
+            return i, FunctionCall(func, self.context, arglist.content)
+
+    def __str__(self):
+        return f"{self.func}({str(self.args).strip('[]')})"
+
+
+class ForeignFunction(Block):
+    def __init__(self, name, varname, context):
+        self.name = name
+        self.varname = varname
+        self.context = context
+        self.func = None
+
+    def __str__(self):
+        try:
+            signature_ = signature(self.func) if self.func else '<unknown>'
+        except ValueError:
+            signature_ = '<unknown>'
+        return f"ffn {'.'.join(self.name)}{signature_}"
+
+    def solve(self, prev_result=None):
+        func, is_callable = self.find()
+        if is_callable:
+            self.func = func
+            self.context[self.varname] = self 
+            return self
+        self.context[self.varname] = Value(func, self.context)
+        return self.context[self.varname]
+
+    def find(self):
+        name = self.name[:]
+        current_name = []
+        defkey = str(object()) 
+        current_name.append(name.pop(0).strip())
+        f = globals().get(
+            current_name[-1], 
+            (
+                __builtins__.get(current_name[-1], defkey) 
+                if isinstance(__builtins__, dict) 
+                else getattr(__builtins__, current_name[-1], defkey)
+            )
+        )
+        if f is defkey:
+            raise EvaluationError(self.context.error(f"{'.'.join(current_name)} is undefined"))
+        while name:
+            current_name.append(name.pop(0))
+            f = getattr(f, current_name[-1], defkey)
+            if f is defkey:
+                raise EvaluationError(self.context.error(f"{self.name} is undefined"))
+        return f, hasattr(f, "__call__")
+
+    def __call__(self, args):
+        args = map(
+            lambda arg: (arg.solve() if isinstance(arg, Token) else arg),
+            args
+        )
+        args = map(
+            lambda arg: (arg.content if isinstance(arg, List) else arg),
+            args
+        )
+        args = [*args]
+        return self.func(*args)
+
+
+    def parse(self: Parser, i):
+        i = 4
+        self.expected = "ffn"
+        while self[i].isspace():
+            i += 1
+            continue
+
+        data = self[i:].split(" as ")
+        if not data:
+            raise self.unexpectedEOF()
+        name = data[0].strip().split(".")
+        if not name:
+            raise ParseError(self.context.error("name in 'ffn name' can't be empty."))
+        if len(data) > 1:
+            varname = data[1].strip()
+        else:
+            varname = name[-1].strip()
+
+        if not varname.replace("_", "").isalnum():
+            raise ParseError(self.context.error(f"'{varname}' is not a valid variable name"))
+
+        return len(self[:]), ForeignFunction(name, varname, self.context)
+
+
+class List(Token):
+    def __init__(self, content, context):
+        self.content = content
+        self.context = context
+
+    def solve(self, prev_result=None):
+        return [(x.solve() if isinstance(x, Token) else x) for x in self.content]
+
+    def parse(self: Parser, i, expect=None):
+        result = []
+        while i < len(self.line):
+            if self[i].isspace() or self[i] == ",":
+                i += 1
+                continue
+            if self[i:i + 1] in ")]":
+                i += 1
+                break
+            parser = Parser(self.context, self[i:], line_number=self.line_number, is_toplevel=False)
+            if expect:
+                parser.expected = expect
+            j, expression = parser.parse()
+            i += j
+            result.append(expression)
+            if self[i:i + 1] in ")]":
+                i += 1
+                break
+        return i, List(result, self.context)
+
+    def __str__(self):
+        return str(self.solve())
+
+
+class Indexing(Token):
+    def __init__(self, index, context):
+        self.context = context
+        self.reference = Number(0, self.context)
+        self.index = index
+
+    def check_ref(self, prev_result=None):
+        ref = self.reference.solve(prev_result)
+
+        if isinstance(ref, Token) and not isinstance(ref, List):
+            raise EvaluationError(self.context.error("Can't use Indexing on non-iterable or undefined instance"))
+        return ref.content if isinstance(ref, List) else ref
+
+    def check_index(self, prev_result=None):
+        index = self.index.solve(prev_result)
+
+        if isinstance(index, Range):
+            return index
+
+        if isinstance(index, Token):
+            raise EvaluationError(self.context.error(f"Undefined index at evaluation time: {index}"))
+        if isinstance(index, float) and index.is_integer():
+            return int(index)
+        return index
+
+    def solve(self, prev_result=None):
+        ref = self.check_ref(prev_result)
+        index = self.check_index(prev_result)
+
+        if isinstance(index, Range):
+            return List(ref[slice(*index.get_values())], self.context)
+        if isinstance(ref, (list, str, tuple)):
+            if not (-len(ref) <= index < len(ref)):
+                raise EvaluationError(self.context.error(f"Invalid index for a iterable of length {len(ref)}: {index}"))
+
+        return self.ensure_token(ref[index])
+
+    def parse(self: Parser, i):
+        while self[i] in "[(":
+            i += 1
+        i_end = i
+        depth = 1
+        while depth:
+            if self[i_end] == "[": depth += 1
+            if self[i_end] == "]": depth -= 1
+            i_end += 1
+        i_end -= 1
+
+        try:
+            i, expression = Range.parse(self, i, i_end)
+        except ParseError:
+            j, expression = Parser(self.context, self[i:i_end], line_number=self.line_number, is_toplevel=False).parse()
+        return i_end + 1, Indexing(expression, self.context)
+
+    def __str__(self):
+        return f"{self.reference}[{self.index}]"
+
+    def assign(self, value):
+        ref = self.check_ref(None)
+        if isinstance(ref, str):
+            raise EvaluationError("Can't assign to a string")
+        index = self.check_index(None)
+        value = value.solve()
+        if isinstance(index, Range):
+            if isinstance(value, (List, String)):
+                value = value.content
+            if not isinstance(value, (list, tuple, str)):
+                value = [value]
+            ref[slice(*index.get_values())] = value
+            return value
+        if index == len(ref):
+            ref.append(value)
+        if isinstance(ref, (list, str, tuple)):
+            if not (-len(ref) <= index < len(ref)):
+                raise EvaluationError(self.context.error(f"Invalid index for a list of length {len(ref)}: {index}"))
+        if isinstance(value, Variable) and value.identifier == "break":
+            return self.ensure_token(ref.pop(index))
+        elif isinstance(value, Token):
+            return Expression([self, Operator("=", self.context), value], self.context)
+        ref[index] = value
+        return value
+        
+
+class Import(Block):
+    def __init__(self, filename, lines, line_number, subcontext, context):
+        self.context = context
+        self.lines_parsed = lines
+        self.line_number = line_number
+        self.subcontext = subcontext
+        self.filename = filename
+
+    def parse(self, i):
+        import_type = []
+        while not self[i].isspace():
+            import_type.append(self[i])
+            i += 1
+        import_type = "".join(import_type)
+        filename = self[i:].strip()
+        self.expected = "ffn"
+        if import_type == "use":
+            try:
+                with open(filename) as file:
+                    lines = file.read().split("\n")
+            except FileNotFoundError:
+                raise EvaluationError(self.context.error(f"ImportError: File '{filename}' not found"))    
+            ctx = Context(lines, name=f"[{filename}]", parent=self.context, parent_access=False)
+            lines = ctx.parse()
+
+            return i, Import(filename, lines, self.line_number, ctx, self.context)
+        else:
+            self.expected = "ffn"
+            data = filename.split(" as ")
+            if not data:
+                raise self.unexpectedEOF()
+
+            name = data[0].strip().split(".")
+            if not name:
+                raise ParseError(self.context.error("name in 'ffn name' can't be empty."))
+            if len(data) > 1:
+                varname = data[1].strip()
+            else:
+                varname = name[-1].strip()
+            
+            try:
+                module = __import__(name[-1].strip())
+                globals()[varname] = module
+
+            except ImportError:
+                raise EvaluationError(self.context.error(f"ImportError: File '{name[-1].strip()}' not found"))    
+            return 0, Number(0, self.context)
+        
+
+    def solve(self, prev_result=None):
+        self.subcontext.run_lines(self.lines_parsed)
+        self.subcontext.flush()
+
+    def __str__(self):
+        return f"use {self.filename}"
+
+
+class String(Token):
+    def __init__(self, content, context):
+        self.content = content
+        self.context = context
+
+    def solve(self, prev_result=None):
+        return self.content
+
+    def parse(self: Parser, i):
+        quote = self[i]
+        i += 1
+        is_escaped = False
+        result = []
+        while i < len(self.line):
+            if not is_escaped:
+                if self[i] == "\\":
+                    is_escaped = True
+                    i += 1
+                    continue
+                if self[i] == quote:
+                    break
+                result.append(self[i])
+                i += 1
+                continue
+            special = {
+                "a": "\a",
+                "b": "\b",
+                "f": "\f",
+                "n": "\n",
+                "r": "\r",
+                "t": "\t",
+            }
+            if self[i] in "\\'\"":
+                char = self[i]
+                i += 1
+            elif self[i] in "u0xU":
+                sub_len = 2
+                if self[i] == "u":
+                    sub_len = 4
+                if self[i] == "U":
+                    sub_len = 8
+                substr = self[i + 1: i + sub_len + 1]
+                try:
+                    code = int(substr, 8 if self[i] == "0" else 16)
+                except ValueError:
+                    raise ParseError(self.context.error(f"invalid {'octal' if self[i] == '0' else 'hexadecimal'} number: '{substr}'."))
+                char = chr(code)
+                i += len(substr) + 1
+            elif self[i] == "N":
+                depth = 0
+                if self[i + 1] != "{":
+                    raise ParseError(self.context.error("Unexpected end of identifier! \\N{...} requires an opening {"))
+                end = self[i:].index("}", None)
+                if end is None:
+                    raise ParseError(self.context.error("Unexpected end of identifier! \\N{...} requires an enclosing }"))
+                name = self[i + 2: i + end]
+                char = unidata.lookup(name)
+                i += end + 1
+            elif self[i] in special:
+                char = special[self[i]]
+                i += 1
+            else:
+                raise ParseError(self.context.error(f"Unrecognized escape: \\{self[i]}"))
+            
+            result.append(char)
+            is_escaped = False
+            continue
+        return i + 1, String("".join(result), self.context)
+
+    def __str__(self):
+        return str([self.content])[1:-1]
+
+
+import sys
+
+
+def exception_handler(exception_type, exception, traceback, debug_hook=sys.excepthook):
+    if need_debug or not isinstance(exception, (ParseError, NestingError, EvaluationError)):
+        debug_hook(exception_type, exception, traceback)
+    else:
+        print("%s: %s" % (exception_type.__name__, exception))
+
+
+sys.excepthook = exception_handler
+
+def ensure_token(self, value, token_type=Value):
+    if isinstance(value, Token):
+        return value
+    return token_type(value, self.context)
+
+Token.ensure_token = ensure_token
+
+def run(filename, debug=False, verbose=False):
+    lines = []
+    if debug:
+        lines.append("debug = 1")
+    if verbose:
+        lines.append("verbose = 1")
+    lines.append(f"use {filename}")
+    Context(lines).run()
+
+
+
+Operator.assignment_ops.extend([f"{x}=" for x in ["+", "-", "*", "/", "%", "/_"]])
+Operator.priorities.update(
+    {x: 1 for x in Operator.assignment_ops[1:]}
+)
+Operator.power = lambda context: Operator("^", context)
+Operator.multiply = lambda context: Operator("*", context)
+Operator.divide = lambda context: Operator("/", context)
+Operator.plus = lambda context: Operator("+", context)
+Operator.minus = lambda context: Operator("-", context)
+
+
+args = list(
+    filter(
+        lambda x: not x.startswith("--"),
+        sys.argv[1:]
+    )
+)
+if args:
+    run(" ".join(args), "--debug" in sys.argv[1:], "--verbose" in sys.argv[1:])
+else:
+    print("No file specified")
