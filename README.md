@@ -19,6 +19,21 @@ It has:
 - [**unsafe**] ability to use objects from current Python environment (and import modules to it)
 - slices
 
+### TODO
+Things written in *italic* are under consideration. This list could be   
+
+Features:
+
+- keyword arguments
+- default values (maybe)
+- namespaces *and classes/objects*
+- return in functions
+
+Other:
+
+- refactor some stuff
+- 
+
 ## Installation and quickstart
 - Get a Python 3.6+ interpreter (the newer the better, but 3.6 should work)
 - Download `matiq` file from repository ( i. e. by `git clone https://github.com/evtn/matiq.git`)
@@ -68,7 +83,7 @@ x = 23/_var // EvaluationError: var is undefined
 ```
 
 ## Unary operators
-Besides common `-` (unary minus) and `~` (unary inverse) there are a few more Unary operators in Matiq:
+Besides common `-` (unary minus) and `~` (unary inverse) there are a few more unary operators in Matiq:
 ```rust
 x = 5
 @x // prints x and returns it
@@ -83,22 +98,81 @@ z = "Hello"
 
 ## Lists
 Lists are containers for any values (numbers, strings, lists, functions, etc).    
-Lists have many operations, mostly based on indexing:
+You can create a list like this:
 ```rust
 x = [10, 67, 89, "Hello", [1, 5, 9, 1]]
-
-@x[0] // prints 10.0 (indexing starts with 0)
-x[0] = [1, 2, 3] // replacing by index
-@x // prints [[1.0, 2.0, 3.0], 67.0, 89.0, 'Hello', [1.0, 5.0, 9.0, 1.0]]
-@x[1..3] // prints [67, 89] (x[1:3])
-x[0..1] = 4 // delete 0..1 elements and insert 4 at index 0
-x[0..0] = 2 // delete 0..0 elements and insert 2 at index 0
-x[1..4] = [8, 9] // delete 1..4 elements and insert 3, 4 at indices 1, 2
-x[?x] = 6 // add element to the end (?x - length of x)
-y = x[0..?x] // copy x to y
-
-@x // prints [2, 8.0, 9.0, 'Hello', [1.0, 5.0, 9.0, 1.0], 6]
+@x // [10, 67, 89, "Hello", [1, 5, 9, 1]]
 ```
+
+### Append
+To append element in the end of the list, you can use `x[?x] = ...` syntax:    
+
+```rust
+y = x[0..?x] // copying the list
+
+y[?y] = 0
+
+@x // [10, 67, 89, "Hello", [1, 5, 9, 1]]
+@y // [10, 67, 89, "Hello", [1, 5, 9, 1], 0]
+```
+
+It's not a special syntax, Matiq just checks if you're trying to assign to an `len(x)` index, and if so, appends a new value at the end.    
+
+### Slices
+You've seen slices in previous section. It's just Range placed in place of index:
+
+```rust
+y = x[0..?x] // copying the list (it's a [0:len(x)] slice)
+@y // [10, 67, 89, "Hello", [1, 5, 9, 1]]
+@y[0..2] // from 0 to 2 ([10, 67])
+@y[2..?x] // from 2 to len(y) ([89, "Hello", [1, 5, 9, 1]])
+@y[-2..?x] // you can use `-n` indices as a shorthand to `?x-n` (["Hello", [1, 5, 9, 1]])
+
+```
+
+### Insertion
+Insertion is simple. You can use slices with assignment to replace some elements with any value or list of values:    
+
+```rust
+y = x[0..?x]
+@y // [10, 67, 89, "Hello", [1, 5, 9, 1]]
+
+y[0..1] = 4 // delete 0..1 elements ([10]) and insert 4 at index 0
+@y // [4, 67, 89, "Hello", [1, 5, 9, 1]]
+       ^
+
+y[0..0] = 2 // delete 0..0 elements ([]) and insert 2 at index 0
+@y // [2, 4, 67, 89, "Hello", [1, 5, 9, 1]]
+       ^
+
+y[1..4] = [8, 9] // delete 1..4 elements ([4, 67, 89]) and insert 8, 9 at indices 1, 2
+@y // [2, 8, 9, "Hello", [1, 5, 9, 1]]
+          ^  ^
+
+```
+
+### Functional style
+
+If you don't like it as it is, you can write some helper functions:    
+```rust
+
+fn list_replace(list, start, stop, values)
+    list[start..stop] = values
+    list
+
+fn list_insert(list, index, value)
+    list[index..index] = value
+    list
+
+fn list_append(list, element)
+    list[?list] = element
+    list
+
+fn list_copy(list)
+    list[0..?list]
+
+```
+
 
 ## Strings
 Strings are similar to Python too.    
@@ -158,7 +232,7 @@ There are few block types: [*('iff' is not a typo)*](https://en.wikipedia.org/wi
 - `ffn name [as varname]` -- foreign object injection
 More on those types below
 ### if
-You've already seen `if` block in previous section. If condition is true, runs its content.
+You've already seen `if` block in previous section. If condition is true, runs its content.    
 Returns condition as its result.
 ```rust
 x = 5
@@ -185,7 +259,7 @@ else
 else
     @"But this one"
 ```
-`else` / `elif` blocks run their contents when previous line returned False. This includes:
+`else` / `elif` blocks run their contents when previous line returned False. This includes:    
 - any `for`/ `while` cycle which ended without a `break`
 - `if`/ `elif` block, when condition is false and there was no `break`
 - any falsy expression
@@ -235,7 +309,7 @@ fn max(a, b)
         max_val = b
     max_val
 ```
-Currently, matiq doesn't support `return`, so you need to write return value as the last expression in the function body.
+Currently, matiq doesn't support `return`, so you need to write return value as the last expression in the function body.    
 *bonus: alternative implementations*
 1. List ternary operator
 ```rust
@@ -269,8 +343,8 @@ x = randint(0, 100)
 ```
 
 ## Foreign objects injection
-As Matiq executes in a Python interpereter, it can heavily use its functions and objects.
-Before going crazy, remember about caveats:
+As Matiq executes in a Python interpereter, it can heavily use its functions and objects.    
+Before going crazy, remember about caveats:    
 - Matiq type system is much narrower than Python type system. Although Matiq is tolerant for unknown types and has some support for tuples and dicts, using `ffn` can lead to unexpected behaviour sometimes
 - There are no keyword args in Matiq. That means you need to implement a Python-side wrapper for keyword arguments support (and dictionary support, too):
 ```rust
@@ -301,7 +375,7 @@ ffn str.upper as toUppercase
 ```
 You can use any identifier or identifier chain divided by dot as `ffn` source. 
 Object would be injected by the name of last part in the chain.
-Or an alias (which should be a valid variable identifier) if `as identiier` used
+Or an alias (which should be a valid variable identifier) if `as identifier` used
 
 ## Debugging
 This section is unfinished.
