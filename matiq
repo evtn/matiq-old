@@ -464,7 +464,10 @@ class Number(Token):
         return self.value 
 
     def __str__(self):
-        return str(self.value)
+        value = self.value
+        if type(value) is float and value.is_integer():
+            value = int(value)
+        return str(value)
 
     def parse(self: Parser, i):
         name = []
