@@ -4,6 +4,7 @@ from typing import Union, Any
 from inspect import signature
 import sys
 import unicodedata as unidata
+import os
 
 need_verbose = False
 need_debug = False
@@ -945,9 +946,14 @@ class FunctionCall(Token):
         func = self.func.solve()
         if func is None:
             raise EvaluationError(self.context.error(f"Undefined function '{self.func}'"))
-        if not isinstance(func, (FunctionDef, ForeignFunction)):
+        if isinstance(func, Value):
+            func = func.value
+        if not hasattr(func, "__call__"):
+            print(dir(func), type(func))
             raise EvaluationError(self.context.error(f"'{self.func}' is not a function"))
-        return self.ensure_token(func(args), Number)
+        if not isinstance(func, (FunctionDef, ForeignFunction)):
+            return self.ensure_token(func(*args), Value)
+        return self.ensure_token(func(args), Value)
 
     def parse(self: Parser, i, func):
         while i < len(self.line):
@@ -1006,7 +1012,7 @@ class ForeignFunction(Block):
                 raise EvaluationError(self.context.error(f"{self.name} is undefined"))
         return f, hasattr(f, "__call__")
 
-    def __call__(self, args):
+    def __call__(self, args, **kwargs):
         args = map(
             lambda arg: (arg.solve() if isinstance(arg, Token) else arg),
             args
@@ -1016,7 +1022,7 @@ class ForeignFunction(Block):
             args
         )
         args = [*args]
-        return self.func(*args)
+        return self.func(*args, **kwargs)
 
 
     def parse(self: Parser, i):
@@ -1335,6 +1341,8 @@ args = list(
         sys.argv[1:]
     )
 )
+sys.path.append(os.getcwd())
+
 if args:
     run(" ".join(args), "--debug" in sys.argv[1:], "--verbose" in sys.argv[1:])
 else:
